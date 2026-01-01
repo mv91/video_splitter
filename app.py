@@ -1,25 +1,43 @@
+import json
+import math
 import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient, ContentSettings
+
 from scenedetect import open_video, detect
-from scenedetect.detectors import ThresholdDetector
-from scenedetect.video_splitter import split_video_ffmpeg
+from scenedetect.detectors import ThresholdDetector, AdaptiveDetector
 from scenedetect.scene_manager import save_images
 from scenedetect.frame_timecode import FrameTimecode
-import math
 
-path = "../video-files/99def53c-a7cb-4d6e-be55-267e0e374b56.mp4"
+
+@dataclass
+class Settings:
+    storage_account: str
+    container: str
+    shortcode: str
+
+    input_dir: Path
+    output_dir: Path
+
+    threshold: float
+    min_scene_len: int
+    default_images_per_scene: int
+
 
 class VideoSplitter:
-    def __init__(self, video_path, threshold=27.0, min_scene_len=15):
+    def __init__(self, video_path: Path, threshold: float = 27.0):
         self.video_path = video_path
-        self.video = open_video(video_path)
+        self.video = open_video(str(video_path))
 
-        detector = ThresholdDetector(
-            threshold=threshold,
-            min_scene_len=min_scene_len,
-            add_final_scene=True,
+        detector = AdaptiveDetector(
+            # threshold=threshold,
+            # add_final_scene=True,
         )
-
-        scene_list = detect(video_path, detector)
+        scene_list = detect(str(video_path), detector)
         self.scene_list = self._ensure_at_least_one_scene(scene_list)
 
     def _ensure_at_least_one_scene(self, scene_list):
@@ -27,60 +45,155 @@ class VideoSplitter:
             return scene_list
 
         start = FrameTimecode(0, self.video.frame_rate)
-
-        # Get total frames in a backend-safe way
         if hasattr(self.video, "duration") and self.video.duration:
             end = self.video.duration
         else:
-            # VideoStreamCv2 fallback
             total_frames = getattr(self.video, "_frame_count", 0)
             end = FrameTimecode(total_frames, self.video.frame_rate)
-
         return [(start, end)]
 
-    def _num_images_for_scenes(self, default_per_scene=3):
-        # If only one scene, sample 1 image per second across the whole video
+    def _num_images_for_scenes(self, default_per_scene: int) -> int:
         if len(self.scene_list) == 1:
             start, end = self.scene_list[0]
             duration_seconds = max(1, math.ceil(end.get_seconds() - start.get_seconds()))
             return duration_seconds
-
-        # Otherwise, keep a fixed number per scene
         return default_per_scene
 
-    def split_video(self, output_dir, save_clips=False, save_scene_images=True, default_images_per_scene=3):
-        os.makedirs(output_dir, exist_ok=True)
+    def save_thumbnails(self, thumbnails_dir: Path, default_images_per_scene: int):
+        thumbnails_dir.mkdir(parents=True, exist_ok=True)
+        num_images = self._num_images_for_scenes(default_images_per_scene)
 
-        if save_clips:
-            split_video_ffmpeg(self.video_path, self.scene_list, output_dir=output_dir)
-
-        if save_scene_images:
-            images_dir = os.path.join(output_dir, "thumbnails")
-            os.makedirs(images_dir, exist_ok=True)
-
-            num_images = self._num_images_for_scenes(default_per_scene=default_images_per_scene)
-
-            save_images(
-                scene_list=self.scene_list,
-                video=self.video,
-                output_dir=images_dir,
-                image_name_template="scene-$SCENE_NUMBER-image-$IMAGE_NUMBER",
-                image_extension="jpg",
-                num_images=num_images,
-            )
+        save_images(
+            scene_list=self.scene_list,
+            video=self.video,
+            output_dir=str(thumbnails_dir),
+            image_name_template="scene-$SCENE_NUMBER-image-$IMAGE_NUMBER",
+            image_extension="jpg",
+            num_images=num_images,
+        )
 
     def get_scenes(self):
         return self.scene_list
 
 
+def load_settings() -> Settings:
+    shortcode = os.getenv("SHORTCODE")
+    if not shortcode:
+        raise ValueError("SHORTCODE env var is required (instagram shortcode folder name)")
+
+    return Settings(
+        storage_account=os.getenv("STORAGE_ACCOUNT", "socialshopper"),
+        container=os.getenv("CONTAINER", "downloads"),
+        shortcode=shortcode,
+        input_dir=Path(os.getenv("INPUT_DIR", "/data/in")),
+        output_dir=Path(os.getenv("OUTPUT_DIR", "/data/out")),
+        threshold=float(os.getenv("THRESHOLD", "27.0")),
+        min_scene_len=int(os.getenv("MIN_SCENE_LEN", "15")),
+        default_images_per_scene=int(os.getenv("DEFAULT_IMAGES_PER_SCENE", "3")),
+    )
+
+
+def blob_service_client(settings: Settings) -> BlobServiceClient:
+    cred = DefaultAzureCredential()
+    return BlobServiceClient(
+        account_url=f"https://{settings.storage_account}.blob.core.windows.net",
+        credential=cred,
+    )
+
+
+def list_mp4_blobs(bsc: BlobServiceClient, container: str, prefix: str) -> List[str]:
+    cc = bsc.get_container_client(container)
+    mp4s = []
+    for blob in cc.list_blobs(name_starts_with=prefix):
+        if blob.name.lower().endswith(".mp4"):
+            mp4s.append(blob.name)
+    return sorted(mp4s)
+
+
+def download_blob_to_file(bsc: BlobServiceClient, container: str, blob_name: str, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    bc = bsc.get_blob_client(container=container, blob=blob_name)
+    with dst.open("wb") as f:
+        stream = bc.download_blob()
+        stream.readinto(f)
+
+
+def upload_file(
+    bsc: BlobServiceClient,
+    container: str,
+    blob_name: str,
+    src: Path,
+    content_type: str | None = None,
+):
+    bc = bsc.get_blob_client(container=container, blob=blob_name)
+    cs = ContentSettings(content_type=content_type) if content_type else None
+    with src.open("rb") as f:
+        bc.upload_blob(f, overwrite=True, content_settings=cs)
+
+
+def main():
+    s = load_settings()
+    s.input_dir.mkdir(parents=True, exist_ok=True)
+    s.output_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix = f"{s.shortcode}/"
+    out_prefix = f"{s.shortcode}/output_scenes/"
+
+    bsc = blob_service_client(s)
+
+    # 1) Find the single mp4 under the shortcode prefix
+    mp4s = list_mp4_blobs(bsc, s.container, prefix)
+    if len(mp4s) == 0:
+        raise FileNotFoundError(f"No mp4 blobs found under {s.container}/{prefix}")
+    if len(mp4s) > 1:
+        raise RuntimeError(f"Expected exactly one mp4 under {s.container}/{prefix}, found: {mp4s}")
+
+    mp4_blob_name = mp4s[0]
+
+    # 2) Download to local disk
+    local_video = s.input_dir / "video.mp4"
+    print(f"[sdk] downloading: {mp4_blob_name} -> {local_video}")
+    download_blob_to_file(bsc, s.container, mp4_blob_name, local_video)
+
+    # 3) Process locally
+    splitter = VideoSplitter(local_video, threshold=s.threshold)
+    scenes = splitter.get_scenes()
+
+    thumbnails_dir = s.output_dir / "thumbnails"
+    splitter.save_thumbnails(thumbnails_dir, default_images_per_scene=s.default_images_per_scene)
+
+    manifest = {
+        "shortcode": s.shortcode,
+        "source_blob": mp4_blob_name,
+        "threshold": s.threshold,
+        "default_images_per_scene": s.default_images_per_scene,
+        "num_scenes": len(scenes),
+        "scenes": [
+            {"index": i + 1, "start": sc[0].get_timecode(), "end": sc[1].get_timecode()}
+            for i, sc in enumerate(scenes)
+        ],
+        "thumbnails": [p.name for p in sorted(thumbnails_dir.glob("*.jpg"))],
+    }
+
+    manifest_path = s.output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # 4) Upload outputs back to blob
+    print(f"[sdk] uploading results to: {s.container}/{out_prefix}")
+
+    upload_file(bsc, s.container, out_prefix + "manifest.json", manifest_path, content_type="application/json")
+
+    for jpg in sorted(thumbnails_dir.glob("*.jpg")):
+        upload_file(
+            bsc,
+            s.container,
+            out_prefix + f"thumbnails/{jpg.name}",
+            jpg,
+            content_type="image/jpeg",
+        )
+
+    print("[sdk] done")
+
+
 if __name__ == "__main__":
-    video_splitter = VideoSplitter(path)
-    scenes = video_splitter.get_scenes()
-
-    print(f"Detected {len(scenes)} scenes.")
-    for i, scene in enumerate(scenes):
-        print(f"Scene {i + 1}: Start - {scene[0].get_timecode()}, End - {scene[1].get_timecode()}")
-
-    output_directory = f"./output_scenes/{os.path.splitext(os.path.basename(path))[0]}/thumbnails"
-    video_splitter.split_video(output_directory, save_clips=False, save_scene_images=True)
-    print(f"Saved outputs in '{output_directory}'.")
+    main()
