@@ -13,6 +13,9 @@ from scenedetect.detectors import ThresholdDetector, AdaptiveDetector
 from scenedetect.scene_manager import save_images
 from scenedetect.frame_timecode import FrameTimecode
 
+import sys
+from azure.servicebus import ServiceBusClient
+
 
 @dataclass
 class Settings:
@@ -195,5 +198,67 @@ def main():
     print("[sdk] done")
 
 
+def run_once_from_servicebus():
+    sb_namespace = os.getenv("SB_NAMESPACE")
+    sb_queue = os.getenv("SB_QUEUE_NAME")
+    if not sb_namespace or not sb_queue:
+        raise RuntimeError("SB_NAMESPACE and SB_QUEUE_NAME env vars are required for event-driven jobs")
+
+    fqdn = sb_namespace if ".servicebus.windows.net" in sb_namespace else f"{sb_namespace}.servicebus.windows.net"
+    cred = DefaultAzureCredential()
+
+    print(f"[sb] connecting to {fqdn} queue={sb_queue}")
+
+    with ServiceBusClient(fqdn, credential=cred) as client:
+        # Auto-renew lock for long video processing
+        with client.get_queue_receiver(
+            sb_queue,
+            max_wait_time=20,
+            auto_lock_renewal_duration=3600,
+        ) as receiver:
+            msgs = receiver.receive_messages(max_message_count=1, max_wait_time=20)
+            if not msgs:
+                print("[sb] no messages; exiting 0")
+                return 0
+
+            msg = msgs[0]
+            try:
+                body = b"".join(msg.body).decode("utf-8")  # iterable of bytes
+                payload = json.loads(body) if body else {}
+
+                shortcode = payload.get("shortcode")
+                if not shortcode:
+                    raise ValueError("Message missing required field: shortcode")
+
+                # Optional: let message override container/blob selection
+                if payload.get("container"):
+                    os.environ["CONTAINER"] = payload["container"]
+                if payload.get("storage_account"):
+                    os.environ["STORAGE_ACCOUNT"] = payload["storage_account"]
+
+                # Keep your existing flow: set SHORTCODE env var
+                os.environ["SHORTCODE"] = shortcode
+
+                print(f"[sb] received shortcode={shortcode}; running job...")
+
+                main()  # <- your existing pipeline
+
+                receiver.complete_message(msg)
+                print("[sb] completed message")
+                return 0
+
+            except Exception as e:
+                print(f"[sb] processing failed: {e}", file=sys.stderr)
+
+                # Retry behavior: abandon puts it back on the queue after lock expires
+                receiver.abandon_message(msg)
+
+                # If you prefer to stop poison-message loops, dead-letter instead:
+                # receiver.dead_letter_message(msg, reason="ProcessingFailed", error_description=str(e))
+
+                return 1
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run_once_from_servicebus())
+

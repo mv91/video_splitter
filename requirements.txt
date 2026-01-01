@@ -8,3 +8,5 @@ scenedetect==0.6.7.1
 tqdm==4.67.1
 azure-identity==1.17.1
 azure-storage-blob==12.22.0
+azure-core==1.37.0
+azure-servicebus==7.14.3
