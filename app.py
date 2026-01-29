@@ -16,6 +16,9 @@ from scenedetect.frame_timecode import FrameTimecode
 import sys
 from azure.servicebus import ServiceBusClient
 
+import shutil
+import re
+
 
 @dataclass
 class Settings:
@@ -29,6 +32,23 @@ class Settings:
     threshold: float
     min_scene_len: int
     default_images_per_scene: int
+
+
+SCENE_RE = re.compile(r"scene-(\d+)-image-(\d+)\.jpg")
+
+
+def reorganize_thumbnails(flat_dir: Path):
+    for img in flat_dir.glob("scene-*-image-*.jpg"):
+        m = SCENE_RE.match(img.name)
+        if not m:
+            continue
+        scene_num, img_num = m.groups()
+
+        scene_dir = flat_dir / f"scene-{scene_num}"
+        scene_dir.mkdir(exist_ok=True)
+
+        new_name = f"image-{img_num}.jpg"
+        shutil.move(str(img), str(scene_dir / new_name))
 
 
 class VideoSplitter:
@@ -58,7 +78,9 @@ class VideoSplitter:
     def _num_images_for_scenes(self, default_per_scene: int) -> int:
         if len(self.scene_list) == 1:
             start, end = self.scene_list[0]
-            duration_seconds = max(1, math.ceil(end.get_seconds() - start.get_seconds()))
+            duration_seconds = max(
+                1, math.ceil(end.get_seconds() - start.get_seconds())
+            )
             return duration_seconds
         return default_per_scene
 
@@ -82,7 +104,9 @@ class VideoSplitter:
 def load_settings() -> Settings:
     shortcode = os.getenv("SHORTCODE")
     if not shortcode:
-        raise ValueError("SHORTCODE env var is required (instagram shortcode folder name)")
+        raise ValueError(
+            "SHORTCODE env var is required (instagram shortcode folder name)"
+        )
 
     return Settings(
         storage_account=os.getenv("STORAGE_ACCOUNT", "socialshopper"),
@@ -113,7 +137,9 @@ def list_mp4_blobs(bsc: BlobServiceClient, container: str, prefix: str) -> List[
     return sorted(mp4s)
 
 
-def download_blob_to_file(bsc: BlobServiceClient, container: str, blob_name: str, dst: Path):
+def download_blob_to_file(
+    bsc: BlobServiceClient, container: str, blob_name: str, dst: Path
+):
     dst.parent.mkdir(parents=True, exist_ok=True)
     bc = bsc.get_blob_client(container=container, blob=blob_name)
     with dst.open("wb") as f:
@@ -149,7 +175,9 @@ def main():
     if len(mp4s) == 0:
         raise FileNotFoundError(f"No mp4 blobs found under {s.container}/{prefix}")
     if len(mp4s) > 1:
-        raise RuntimeError(f"Expected exactly one mp4 under {s.container}/{prefix}, found: {mp4s}")
+        raise RuntimeError(
+            f"Expected exactly one mp4 under {s.container}/{prefix}, found: {mp4s}"
+        )
 
     mp4_blob_name = mp4s[0]
 
@@ -163,7 +191,11 @@ def main():
     scenes = splitter.get_scenes()
 
     thumbnails_dir = s.output_dir / "thumbnails"
-    splitter.save_thumbnails(thumbnails_dir, default_images_per_scene=s.default_images_per_scene)
+    splitter.save_thumbnails(
+        thumbnails_dir, default_images_per_scene=s.default_images_per_scene
+    )
+
+    reorganize_thumbnails(thumbnails_dir)
 
     manifest = {
         "shortcode": s.shortcode,
@@ -175,7 +207,10 @@ def main():
             {"index": i + 1, "start": sc[0].get_timecode(), "end": sc[1].get_timecode()}
             for i, sc in enumerate(scenes)
         ],
-        "thumbnails": [p.name for p in sorted(thumbnails_dir.glob("*.jpg"))],
+        "thumbnails": [
+            str(p.relative_to(thumbnails_dir))
+            for p in sorted(thumbnails_dir.rglob("*.jpg"))
+        ],
     }
 
     manifest_path = s.output_dir / "manifest.json"
@@ -184,27 +219,39 @@ def main():
     # 4) Upload outputs back to blob
     print(f"[sdk] uploading results to: {s.container}/{out_prefix}")
 
-    upload_file(bsc, s.container, out_prefix + "manifest.json", manifest_path, content_type="application/json")
+    upload_file(
+        bsc,
+        s.container,
+        out_prefix + "manifest.json",
+        manifest_path,
+        content_type="application/json",
+    )
 
-    for jpg in sorted(thumbnails_dir.glob("*.jpg")):
+    for jpg in thumbnails_dir.rglob("*.jpg"):
         upload_file(
             bsc,
             s.container,
-            out_prefix + f"thumbnails/{jpg.name}",
+            out_prefix + f"thumbnails/{jpg.relative_to(thumbnails_dir)}",
             jpg,
             content_type="image/jpeg",
         )
 
-    print("[sdk] done")
+        print("[sdk] done")
 
 
 def run_once_from_servicebus():
     sb_namespace = os.getenv("SB_NAMESPACE")
     sb_queue = os.getenv("SB_QUEUE_NAME")
     if not sb_namespace or not sb_queue:
-        raise RuntimeError("SB_NAMESPACE and SB_QUEUE_NAME env vars are required for event-driven jobs")
+        raise RuntimeError(
+            "SB_NAMESPACE and SB_QUEUE_NAME env vars are required for event-driven jobs"
+        )
 
-    fqdn = sb_namespace if ".servicebus.windows.net" in sb_namespace else f"{sb_namespace}.servicebus.windows.net"
+    fqdn = (
+        sb_namespace
+        if ".servicebus.windows.net" in sb_namespace
+        else f"{sb_namespace}.servicebus.windows.net"
+    )
     cred = DefaultAzureCredential()
 
     print(f"[sb] connecting to {fqdn} queue={sb_queue}")
@@ -261,4 +308,3 @@ def run_once_from_servicebus():
 
 if __name__ == "__main__":
     raise SystemExit(run_once_from_servicebus())
-
